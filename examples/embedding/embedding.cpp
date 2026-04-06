@@ -3,7 +3,6 @@
 #include "log.h"
 #include "llama.h"
 
-#include <clocale>
 #include <ctime>
 #include <algorithm>
 
@@ -95,8 +94,6 @@ static void print_raw_embeddings(const float * emb,
 }
 
 int main(int argc, char ** argv) {
-    std::setlocale(LC_NUMERIC, "C");
-
     common_params params;
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_EMBEDDING)) {

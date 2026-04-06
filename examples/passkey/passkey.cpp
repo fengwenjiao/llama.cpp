@@ -3,7 +3,6 @@
 #include "log.h"
 #include "llama.h"
 
-#include <clocale>
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -17,8 +16,6 @@ static void print_usage(int, char ** argv) {
 }
 
 int main(int argc, char ** argv) {
-    std::setlocale(LC_NUMERIC, "C");
-
     common_params params;
 
     params.n_junk = 250;

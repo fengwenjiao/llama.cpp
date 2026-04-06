@@ -9,6 +9,10 @@
 
 #include "server-common.h"
 
+#ifdef PRIMA_DISTRIBUTED
+#include "prima.h"
+#endif
+
 #include <random>
 #include <sstream>
 #include <fstream>
@@ -231,77 +235,19 @@ server_tokens::server_tokens(mtmd::input_chunks & mtmd_chunks, bool has_mtmd) : 
 server_tokens::server_tokens(const llama_tokens & tokens, bool has_mtmd) : has_mtmd(has_mtmd), tokens(tokens) {
 }
 
-llama_pos server_tokens::pos_next(int64_t n_tokens) const {
+llama_pos server_tokens::pos_next() const {
     if (!has_mtmd) {
-        if (n_tokens < 0) {
-            return tokens.size();
-        }
-
-        return n_tokens;
+        return tokens.size();
     }
 
-    if (n_tokens < 0) {
-        llama_pos res = tokens.size();
+    llama_pos res = tokens.size();
 
-        for (auto it = map_idx_to_media.begin(); it != map_idx_to_media.end(); ++it) {
-            const auto & chunk = it->second;
-            res += mtmd_input_chunk_get_n_pos(chunk.get()) - mtmd_input_chunk_get_n_tokens(chunk.get());
-        }
-
-        return res;
+    for (auto it = map_idx_to_media.begin(); it != map_idx_to_media.end(); ++it) {
+        const auto & chunk = it->second;
+        res += mtmd_input_chunk_get_n_pos(chunk.get()) - mtmd_input_chunk_get_n_tokens(chunk.get());
     }
 
-    int64_t idx = 0;
-    llama_pos pos = 0;
-
-    GGML_ASSERT(n_tokens <= (int64_t)tokens.size());
-
-    while (idx < n_tokens) {
-        const auto media_it = map_idx_to_media.find(idx);
-        if (media_it != map_idx_to_media.end()) {
-            const auto & chunk = media_it->second;
-            const llama_pos n_pos = mtmd_input_chunk_get_n_pos(chunk.get());
-            const size_t n_tok = mtmd_input_chunk_get_n_tokens(chunk.get());
-
-            pos += n_pos;
-            idx += n_tok;
-        } else {
-            pos++;
-            idx++;
-        }
-    }
-
-    return pos;
-}
-
-size_t server_tokens::size_up_to_pos(llama_pos max_pos) const {
-    if (!has_mtmd) {
-        return std::min((size_t)max_pos, tokens.size());
-    }
-
-    size_t idx = 0;
-    llama_pos pos = 0;
-
-    while (idx < tokens.size()) {
-        const auto media_it = map_idx_to_media.find(idx);
-        if (media_it != map_idx_to_media.end()) {
-            const auto & chunk = media_it->second;
-            const llama_pos n_pos = mtmd_input_chunk_get_n_pos(chunk.get());
-            const size_t n_tok = mtmd_input_chunk_get_n_tokens(chunk.get());
-
-            pos += n_pos;
-            idx += n_tok;
-        } else {
-            pos++;
-            idx++;
-        }
-
-        if (pos >= max_pos) {
-            break;
-        }
-    }
-
-    return idx;
+    return res;
 }
 
 std::string server_tokens::str() const {
@@ -512,13 +458,126 @@ bool server_tokens::validate(const struct llama_context * ctx) const {
 int32_t server_tokens::process_chunk(
             llama_context * ctx,
             mtmd_context * mctx,
+            struct prima_context * pctx,
             size_t idx,
             llama_pos pos,
             int32_t seq_id,
             size_t & n_tokens_out) const {
     const auto & chunk = find_chunk(idx);
-    const char * name = mtmd_input_chunk_get_type(chunk.get()) == MTMD_INPUT_CHUNK_TYPE_IMAGE
+    auto chunk_type = mtmd_input_chunk_get_type(chunk.get());
+    const char * name = chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE
                         ? "image" : "audio";
+
+#ifdef PRIMA_DISTRIBUTED
+    // Distributed path: encode on Rank 0, decode via prima_decode (Ring topology)
+    if (pctx && !prima_is_single_device(pctx)) {
+        SRV_INF("processing %s (distributed)...\n", name);
+
+        if (chunk_type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+            LOG_ERR("process_chunk: expected image/audio chunk, got text\n");
+            n_tokens_out = 0;
+            return -1;
+        }
+
+        int64_t t0 = ggml_time_ms();
+
+        // 1. Encode the chunk (image/audio → embeddings, Rank 0 only)
+        int32_t ret = mtmd_encode_chunk(mctx, chunk.get());
+        if (ret != 0) {
+            LOG_ERR("failed to encode %s chunk\n", name);
+            n_tokens_out = 0;
+            return ret;
+        }
+        SRV_INF("%s encoded in %" PRId64 " ms\n", name, ggml_time_ms() - t0);
+
+        float * embd = mtmd_get_output_embd(mctx);
+        const llama_model * model = llama_get_model(ctx);
+        int n_mmproj_embd = llama_model_n_embd_inp(model);
+        int n_pos_per_embd = mtmd_decode_use_mrope(mctx) ? 4 : 1;
+
+        int32_t n_tokens = (int32_t) mtmd_input_chunk_get_n_tokens(chunk.get());
+        int32_t n_batch  = llama_n_batch(ctx);
+
+        // 2. Build embd batch with correct position layout
+        decode_embd_batch batch_embd(embd, n_tokens, n_pos_per_embd, n_mmproj_embd);
+
+        if (mtmd_decode_use_mrope(mctx)) {
+            if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+                const auto image_tokens = mtmd_input_chunk_get_tokens_image(chunk.get());
+                if (!image_tokens) {
+                    LOG_ERR("failed to process chunk: image tokens are null\n");
+                    n_tokens_out = 0;
+                    return -1;
+                }
+                const int nx = (int) mtmd_image_tokens_get_nx(image_tokens);
+                const int ny = (int) mtmd_image_tokens_get_ny(image_tokens);
+                batch_embd.set_position_mrope_2d(pos, nx, ny, seq_id);
+            } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+                batch_embd.set_position_mrope_1d(pos, seq_id);
+            } else {
+                GGML_ABORT("invalid chunk type for M-RoPE");
+            }
+        } else {
+            batch_embd.set_position_normal(pos, seq_id);
+        }
+
+        // 3. Non-causal attention setup
+        bool use_non_causal = mtmd_decode_use_non_causal(mctx);
+        if (use_non_causal) {
+            prima_set_non_causal(pctx, true);
+            llama_set_causal_attn(ctx, false);
+        }
+
+        // 4. Decode in batches through the Ring topology
+        int32_t n_img_batches = GGML_PAD(n_tokens, n_batch) / n_batch;
+        int32_t i_batch = 0;
+        ret = 0;
+
+        while (i_batch < n_img_batches) {
+            int pos_offset = i_batch * n_batch;
+            int n_tokens_batch = std::min(n_batch, n_tokens - pos_offset);
+            llama_batch batch_view = batch_embd.get_view(pos_offset, n_tokens_batch);
+
+            SRV_INF("decoding %s batch %d/%d (distributed), n_tokens_batch = %d\n",
+                     name, i_batch + 1, n_img_batches, n_tokens_batch);
+
+            int64_t t1 = ggml_time_ms();
+            ret = prima_decode(pctx, batch_view);
+            if (ret != 0) {
+                LOG_ERR("failed to decode %s (distributed)\n", name);
+                break;
+            }
+
+            // prima_decode consumed the non-causal flag; re-set for subsequent sub-batches
+            if (use_non_causal && i_batch + 1 < n_img_batches) {
+                prima_set_non_causal(pctx, true);
+            }
+
+            SRV_INF("%s decoded (batch %d/%d) in %" PRId64 " ms\n",
+                     name, i_batch + 1, n_img_batches, ggml_time_ms() - t1);
+            i_batch++;
+        }
+
+        // 5. Restore causal attention (always, even on error)
+        if (use_non_causal) {
+            llama_set_causal_attn(ctx, true);
+        }
+
+        SRV_INF("%s processed (distributed) in %" PRId64 " ms\n", name, ggml_time_ms() - t0);
+
+        if (ret != 0) {
+            n_tokens_out = 0;
+            return ret;
+        }
+
+        n_tokens_out = n_tokens;
+        return 0;
+    }
+#else
+    (void)pctx;
+#endif
+
+    // Non-distributed path: use existing mtmd_helper_eval_chunk_single
     SRV_INF("processing %s...\n", name);
     int32_t n_batch = llama_n_batch(ctx);
     int64_t t0 = ggml_time_ms();
@@ -1065,7 +1124,6 @@ json oaicompat_chat_params_parse(
 
         inputs.add_generation_prompt = true;
     }
-    inputs.force_pure_content = opt.force_pure_content;
 
     // Apply chat template to the list of messages
     auto chat_params = common_chat_templates_apply(opt.tmpls.get(), inputs);
@@ -1100,22 +1158,6 @@ json oaicompat_chat_params_parse(
     }
     if (!chat_params.parser.empty()) {
         llama_params["chat_parser"] = chat_params.parser;
-    }
-
-    // Reasoning budget: pass parameters through to sampling layer
-    {
-        int reasoning_budget = opt.reasoning_budget;
-        if (reasoning_budget == -1 && body.contains("thinking_budget_tokens")) {
-            reasoning_budget = json_value(body, "thinking_budget_tokens", -1);
-        }
-
-        if (reasoning_budget >= 0 && !chat_params.thinking_end_tag.empty()) {
-            llama_params["reasoning_budget_tokens"] = reasoning_budget;
-            llama_params["reasoning_budget_start_tag"] = chat_params.thinking_start_tag;
-            llama_params["reasoning_budget_end_tag"] = chat_params.thinking_end_tag;
-            llama_params["reasoning_budget_message"] = opt.reasoning_budget_message;
-            llama_params["reasoning_budget_activate_immediately"] = chat_params.thinking_forced_open;
-        }
     }
 
     // Handle "logprobs" field
@@ -1274,27 +1316,17 @@ json convert_responses_to_chatcmpl(const json & response_body) {
 
                 for (const auto & output_text : item.at("content")) {
                     const std::string type = json_value(output_text, "type", std::string());
-                    if (type == "output_text") {
-                        if (!exists_and_is_string(output_text, "text")) {
-                            throw std::invalid_argument("'Output text' requires 'text'");
-                            // Ignore annotations and logprobs for now
-                            chatcmpl_content.push_back({
-                                {"text", output_text.at("text")},
-                                {"type", "text"},
-                            });
-                        }
-                    } else if (type == "refusal") {
-                        if (!exists_and_is_string(output_text, "refusal")) {
-                            throw std::invalid_argument("'Refusal' requires 'refusal'");
-                            // Ignore annotations and logprobs for now
-                            chatcmpl_content.push_back({
-                                {"refusal", output_text.at("refusal")},
-                                {"type", "refusal"},
-                            });
-                        }
-                    } else {
-                        throw std::invalid_argument("'type' must be one of 'output_text' or 'refusal'");
+                    if (type != "output_text") {
+                        throw std::invalid_argument("'type' must be 'output_text'");
                     }
+                    if (!exists_and_is_string(output_text, "text")) {
+                        throw std::invalid_argument("'Output text' requires 'text'");
+                    }
+                    // Ignore annotations and logprobs for now
+                    chatcmpl_content.push_back({
+                        {"text", output_text.at("text")},
+                        {"type", "text"},
+                    });
                 }
 
                 if (merge_prev) {
@@ -1490,7 +1522,6 @@ json convert_anthropic_to_oai(const json & body) {
             json tool_calls = json::array();
             json converted_content = json::array();
             json tool_results = json::array();
-            std::string reasoning_content;
             bool has_tool_calls = false;
 
             for (const auto & block : content) {
@@ -1498,8 +1529,6 @@ json convert_anthropic_to_oai(const json & body) {
 
                 if (type == "text") {
                     converted_content.push_back(block);
-                } else if (type == "thinking") {
-                    reasoning_content += json_value(block, "thinking", std::string());
                 } else if (type == "image") {
                     json source = json_value(block, "source", json::object());
                     std::string source_type = json_value(source, "type", std::string());
@@ -1558,18 +1587,15 @@ json convert_anthropic_to_oai(const json & body) {
                 }
             }
 
-            if (!converted_content.empty() || has_tool_calls || !reasoning_content.empty()) {
+            if (!converted_content.empty() || has_tool_calls) {
                 json new_msg = {{"role", role}};
                 if (!converted_content.empty()) {
                     new_msg["content"] = converted_content;
-                } else if (has_tool_calls || !reasoning_content.empty()) {
+                } else if (has_tool_calls) {
                     new_msg["content"] = "";
                 }
                 if (!tool_calls.empty()) {
                     new_msg["tool_calls"] = tool_calls;
-                }
-                if (!reasoning_content.empty()) {
-                    new_msg["reasoning_content"] = reasoning_content;
                 }
                 oai_messages.push_back(new_msg);
             }

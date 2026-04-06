@@ -1,5 +1,3 @@
-#pragma once
-
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
@@ -8,15 +6,14 @@
 
 #include <cstddef>
 #include <memory>
-#include <set>
 
 struct server_context_impl; // private implementation
+
+struct prima_context;
 
 struct server_context_meta {
     std::string build_info;
     std::string model_name;
-    std::set<std::string> model_aliases;
-    std::set<std::string> model_tags;
     std::string model_path;
     bool has_mtmd;
     bool has_inp_image;
@@ -74,6 +71,21 @@ struct server_context {
     // get server metadata (read-only), can only be called after load_model()
     // not thread-safe, should only be used from the main thread
     server_context_meta get_meta() const;
+
+#ifdef PRIMA_DISTRIBUTED
+    // load with an externally created model + prima distributed context
+    // the caller owns the model and prima_context lifetime
+    bool load_model_distributed(const common_params & params, llama_model * model, prima_context * pctx);
+#endif
+
+    // KV cache watermark: when enabled, backpressure and swap kick in
+    // to prevent generation truncation when KV usage approaches n_ctx.
+    //   wm_high:     stop accepting new requests above this ratio (e.g. 0.65)
+    //   wm_critical: swap threshold (e.g. 0.85)
+    //   rotate:      false = basic (swap out, wait for others to finish)
+    //                true  = rotational (time-sliced, all slots make progress)
+    // Both 0 = disabled (default).
+    void set_kv_watermark(float wm_high, float wm_critical, bool rotate = false, int32_t qmin = 200);
 };
 
 

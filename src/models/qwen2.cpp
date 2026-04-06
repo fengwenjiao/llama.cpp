@@ -1,10 +1,10 @@
 #include "models.h"
 
 llm_build_qwen2::llm_build_qwen2(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
-    const int64_t n_embd_head = hparams.n_embd_head_v();
+    const int64_t n_embd_head = hparams.n_embd_head_v;
 
-    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
-    GGML_ASSERT(n_embd_head == n_rot);
+    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
+    GGML_ASSERT(n_embd_head == hparams.n_rot);
 
     ggml_tensor * cur;
     ggml_tensor * inpL;
@@ -19,6 +19,11 @@ llm_build_qwen2::llm_build_qwen2(const llama_model & model, const llm_graph_para
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     for (int il = 0; il < n_layer; ++il) {
+        // prima: skip layers not owned by this device (pipeline parallelism)
+        if (!layer_is_active(il)) {
+            continue;
+        }
+
         ggml_tensor * inpSA = inpL;
 
         // norm
@@ -75,7 +80,7 @@ llm_build_qwen2::llm_build_qwen2(const llama_model & model, const llm_graph_para
                     model.layers[il].wo, model.layers[il].bo,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
         }
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == n_layer - 1 && inp_out_ids && model.output_norm) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -106,21 +111,36 @@ llm_build_qwen2::llm_build_qwen2(const llama_model & model, const llm_graph_para
     }
     cur = inpL;
 
-    cur = build_norm(cur,
-            model.output_norm, NULL,
-            LLM_NORM_RMS, -1);
-
-    cb(cur, "result_norm", -1);
-    res->t_embd = cur;
-
-    // lm_head
-    cur = build_lora_mm(model.output, cur);
-
-    if (model.output_b != nullptr) {
-        cur = ggml_add(ctx0, cur, model.output_b);
+    // prima: when the last model layer is not active on this rank (distributed
+    // pipeline parallelism), the in-loop output compaction at il == n_layer-1
+    // was skipped.  Apply it here so output_norm + lm_head see [n_embd, n_outputs].
+    if (inp_out_ids && model.output_norm && !layer_is_active(n_layer - 1)) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
-    cb(cur, "result_output", -1);
-    res->t_logits = cur;
+
+    if (model.output_norm) {
+        cur = build_norm(cur,
+                model.output_norm, NULL,
+                LLM_NORM_RMS, -1);
+
+        cb(cur, "result_norm", -1);
+        res->t_embd = cur;
+
+        if (model.output) {
+            // lm_head
+            cur = build_lora_mm(model.output, cur);
+
+            if (model.output_b != nullptr) {
+                cur = ggml_add(ctx0, cur, model.output_b);
+            }
+            cb(cur, "result_output", -1);
+            res->t_logits = cur;
+        }
+    } else {
+        // prima: worker in distributed inference — no output head available
+        // graph ends at the last active layer's l_out
+        res->t_embd = cur;
+    }
 
     ggml_build_forward_expand(gf, cur);
 }

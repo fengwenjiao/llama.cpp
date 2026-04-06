@@ -167,12 +167,7 @@ public:
     // for debugging
     std::string str() const;
 
-    // the next position after n_tokens. if n_tokens < 0, return the next position after all tokens.
-    llama_pos pos_next(int64_t n_tokens = -1) const;
-
-    // number of tokens with position < max_pos
-    size_t size_up_to_pos(llama_pos max_pos) const;
-
+    llama_pos pos_next() const;
     const mtmd::input_chunk_ptr & find_chunk(size_t idx) const;
 
     void push_back(llama_token tok);
@@ -211,9 +206,11 @@ public:
     bool validate(const struct llama_context * ctx) const;
 
     // encode and decode the image chunk
+    // pctx: distributed context (nullptr for single-device mode)
     int32_t process_chunk(
                 llama_context * ctx,
                 mtmd_context * mctx,
+                struct prima_context * pctx,
                 size_t idx,
                 llama_pos pos,
                 int32_t seq_id,
@@ -287,10 +284,7 @@ struct server_chat_params {
     bool allow_image;
     bool allow_audio;
     bool enable_thinking = true;
-    int  reasoning_budget = -1;
-    std::string reasoning_budget_message;
     std::string media_path;
-    bool force_pure_content = false;
 };
 
 // used by /completions endpoint

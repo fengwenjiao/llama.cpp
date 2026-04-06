@@ -534,6 +534,10 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
+    // prima: layer filter for distributed inference
+    llama_layer_filter_cb layer_filter    = nullptr;
+    void *                layer_filter_ud = nullptr;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -742,6 +746,16 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
+    // prima: layer filter for distributed inference
+    llama_layer_filter_cb layer_filter    = nullptr;
+    void *                layer_filter_ud = nullptr;
+
+    // prima: check if a layer should be included in the computation graph
+    bool layer_is_active(int32_t il) const {
+        if (!layer_filter) return true;
+        return layer_filter(il, layer_filter_ud);
+    }
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const llm_graph_cb & cb_func;
@@ -764,11 +778,10 @@ struct llm_graph_context {
              ggml_tensor * cur,
                      int   il) const;
 
-    // do mat_mul, while optionally apply lora and per-tensor scale
+    // do mat_mul, while optionally apply lora
     ggml_tensor * build_lora_mm(
               ggml_tensor * w,
-              ggml_tensor * cur,
-              ggml_tensor * w_s = nullptr) const;
+              ggml_tensor * cur) const;
 
     // do mat_mul_id, while optionally apply lora
     ggml_tensor * build_lora_mm_id(
@@ -811,14 +824,11 @@ struct llm_graph_context {
                  int64_t   n_expert_used,
          llm_ffn_op_type   type_op,
                     bool   norm_w,
+                    bool   scale_w,
                    float   w_scale,
             llama_expert_gating_func_type gating_op,
                      int   il,
-             ggml_tensor * probs_in = nullptr,
-             ggml_tensor * gate_up_exps = nullptr,
-             ggml_tensor * up_exps_s = nullptr,
-             ggml_tensor * gate_exps_s = nullptr,
-             ggml_tensor * down_exps_s = nullptr) const;
+             ggml_tensor * probs_in = nullptr) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -835,15 +845,11 @@ struct llm_graph_context {
                  int64_t   n_expert_used,
          llm_ffn_op_type   type_op,
                     bool   norm_w,
+                    bool   scale_w,
                    float   w_scale,
             llama_expert_gating_func_type gating_op,
                      int   il,
-             ggml_tensor * probs_in = nullptr,
-             ggml_tensor * gate_up_exps = nullptr,
-             ggml_tensor * gate_up_exps_b = nullptr,
-             ggml_tensor * up_exps_s = nullptr,
-             ggml_tensor * gate_exps_s = nullptr,
-             ggml_tensor * down_exps_s = nullptr) const;
+             ggml_tensor * probs_in = nullptr) const;
 
     //
     // inputs

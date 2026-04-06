@@ -1,10 +1,10 @@
 #include "models.h"
 
 llm_build_qwen3moe::llm_build_qwen3moe(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
-    const int64_t n_embd_head = hparams.n_embd_head_v();
+    const int64_t n_embd_head = hparams.n_embd_head_v;
 
-    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
-    GGML_ASSERT(n_embd_head == n_rot);
+    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
+    GGML_ASSERT(n_embd_head == hparams.n_rot);
 
     ggml_tensor * cur;
     ggml_tensor * inpL;
@@ -19,6 +19,11 @@ llm_build_qwen3moe::llm_build_qwen3moe(const llama_model & model, const llm_grap
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     for (int il = 0; il < n_layer; ++il) {
+        // prima: skip layers not owned by this device (pipeline parallelism)
+        if (!layer_is_active(il)) {
+            continue;
+        }
+
         ggml_tensor * inpSA = inpL;
 
         // norm
@@ -30,13 +35,13 @@ llm_build_qwen3moe::llm_build_qwen3moe(const llama_model & model, const llm_grap
         // self_attention
         {
             // compute Q and K and RoPE them
-            ggml_tensor * Qcur = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s);
+            ggml_tensor * Qcur = build_lora_mm(model.layers[il].wq, cur);
             cb(Qcur, "Qcur", il);
 
-            ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
+            ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur);
             cb(Kcur, "Kcur", il);
 
-            ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
+            ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur);
             cb(Vcur, "Vcur", il);
 
             Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
@@ -68,11 +73,8 @@ llm_build_qwen3moe::llm_build_qwen3moe(const llama_model & model, const llm_grap
             cur = build_attn(inp_attn,
                     model.layers[il].wo, model.layers[il].bo,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
-            if (model.layers[il].wo_s) {
-                cur = ggml_mul(ctx0, cur, model.layers[il].wo_s);
-            }
         }
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == n_layer - 1 && inp_out_ids && model.output_norm) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -94,13 +96,9 @@ llm_build_qwen3moe::llm_build_qwen3moe(const llama_model & model, const llm_grap
                     nullptr,
                     n_expert, n_expert_used,
                     LLM_FFN_SILU, true,
-                    hparams.expert_weights_scale,
+                    false, 0.0,
                     LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
-                    il,
-                    nullptr, nullptr,
-                    model.layers[il].ffn_up_exps_s,
-                    model.layers[il].ffn_gate_exps_s,
-                    model.layers[il].ffn_down_exps_s);
+                    il);
         cb(moe_out, "ffn_moe_out", il);
         cur = moe_out;
 
@@ -114,18 +112,33 @@ llm_build_qwen3moe::llm_build_qwen3moe(const llama_model & model, const llm_grap
     }
     cur = inpL;
 
-    cur = build_norm(cur,
-            model.output_norm, NULL,
-            LLM_NORM_RMS, -1);
+    // prima: when the last model layer is not active on this rank (distributed
+    // pipeline parallelism), the in-loop output compaction at il == n_layer-1
+    // was skipped.  Apply it here so output_norm + lm_head see [n_embd, n_outputs].
+    if (inp_out_ids && model.output_norm && !layer_is_active(n_layer - 1)) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
 
-    cb(cur, "result_norm", -1);
-    res->t_embd = cur;
+    if (model.output_norm) {
+        cur = build_norm(cur,
+                model.output_norm, NULL,
+                LLM_NORM_RMS, -1);
 
-    // lm_head
-    cur = build_lora_mm(model.output, cur);
+        cb(cur, "result_norm", -1);
+        res->t_embd = cur;
 
-    cb(cur, "result_output", -1);
-    res->t_logits = cur;
+        if (model.output) {
+            // lm_head
+            cur = build_lora_mm(model.output, cur);
+
+            cb(cur, "result_output", -1);
+            res->t_logits = cur;
+        }
+    } else {
+        // prima: worker in distributed inference — no output head available
+        // graph ends at the last active layer's l_out
+        res->t_embd = cur;
+    }
 
     ggml_build_forward_expand(gf, cur);
 }

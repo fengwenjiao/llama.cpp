@@ -62,9 +62,7 @@ size_t apir_buffer_type_get_max_size(virtgpu * gpu, apir_buffer_type_host_handle
     return max_size;
 }
 
-apir_buffer_context_t apir_buffer_type_alloc_buffer(virtgpu *                      gpu,
-                                                    apir_buffer_type_host_handle_t host_handle,
-                                                    size_t                         size) {
+apir_buffer_context_t apir_buffer_type_alloc_buffer(virtgpu * gpu, apir_buffer_type_host_handle_t host_handle, size_t size) {
     apir_encoder *        encoder;
     apir_decoder *        decoder;
     ApirForwardReturnCode ret;
@@ -86,9 +84,7 @@ apir_buffer_context_t apir_buffer_type_alloc_buffer(virtgpu *                   
     return buffer_context;
 }
 
-size_t apir_buffer_type_get_alloc_size(virtgpu *                      gpu,
-                                       apir_buffer_type_host_handle_t host_handle,
-                                       const ggml_tensor *            op) {
+size_t apir_buffer_type_get_alloc_size(virtgpu * gpu, apir_buffer_type_host_handle_t host_handle, const ggml_tensor * op) {
     apir_encoder *        encoder;
     apir_decoder *        decoder;
     ApirForwardReturnCode ret;

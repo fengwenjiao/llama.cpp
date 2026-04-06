@@ -234,6 +234,17 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    // prima extension hooks
+    llama_layer_filter_cb layer_filter          = nullptr;
+    void *                layer_filter_ud       = nullptr;
+
+    llama_decode_cb       pre_decode_cb         = nullptr;
+    llama_decode_cb       post_decode_cb        = nullptr;
+    void *                decode_cb_ud          = nullptr;
+
+    llama_memory_op_cb    memory_op_cb          = nullptr;
+    void *                memory_op_cb_ud       = nullptr;
+
 private:
     llm_graph_params graph_params(
                         llm_graph_result * res,

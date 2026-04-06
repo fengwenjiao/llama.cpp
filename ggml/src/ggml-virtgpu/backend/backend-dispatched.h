@@ -1,6 +1,5 @@
 #pragma once
 
-// clang-format off
 #include <cstdint>
 #include <cstddef>
 
@@ -11,7 +10,6 @@
 #include "shared/apir_backend.h"
 #include "shared/apir_cs.h"
 #include "shared/apir_cs_ggml.h"
-// clang-format on
 
 #define GGML_VIRTGPU_BCK "ggml-virtgpu-backend: "
 

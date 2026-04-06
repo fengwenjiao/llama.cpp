@@ -81,10 +81,6 @@ export interface ApiModelDataEntry {
 	path: string;
 	/** Current status of the model */
 	status: ApiModelStatus;
-	/** Alternative names that resolve to this model */
-	aliases?: string[];
-	/** Informational tags for this model */
-	tags?: string[];
 	/** Legacy meta field (may be present in older responses) */
 	meta?: Record<string, unknown> | null;
 }

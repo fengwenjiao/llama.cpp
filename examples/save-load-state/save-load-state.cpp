@@ -2,14 +2,11 @@
 #include "common.h"
 #include "llama.h"
 
-#include <clocale>
 #include <vector>
 #include <cstdio>
 
 
 int main(int argc, char ** argv) {
-    std::setlocale(LC_NUMERIC, "C");
-
     common_params params;
 
     params.prompt = "The quick brown fox";

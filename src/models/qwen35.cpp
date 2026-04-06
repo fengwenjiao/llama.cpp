@@ -4,9 +4,9 @@
 
 llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(model) {
-    const int64_t n_embd_head = hparams.n_embd_head_v();
+    const int64_t n_embd_head = hparams.n_embd_head_v;
 
-    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
+    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
 
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
@@ -24,6 +24,11 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     for (int il = 0; il < n_layer; ++il) {
+        // prima: skip layers not owned by this device (pipeline parallelism)
+        if (!layer_is_active(il)) {
+            continue;
+        }
+
         ggml_tensor * inpSA = inpL;
 
         cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
@@ -62,7 +67,6 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
 
         // Residual connection for FFN - add to the tensor from before post_attention_layernorm
         cur = ggml_add(ctx0, cur, ffn_residual);
-        cb(cur, "post_ffn", il);
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
@@ -72,17 +76,31 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
     }
     cur = inpL;
 
-    // Final norm
-    cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+    // prima: when the last model layer is not active on this rank (distributed
+    // pipeline parallelism), the in-loop output compaction at il == n_layer-1
+    // was skipped.  Apply it here so output_norm + lm_head see [n_embd, n_outputs].
+    if (inp_out_ids && model.output_norm && !layer_is_active(n_layer - 1)) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
 
-    cb(cur, "result_norm", -1);
-    res->t_embd = cur;
+    if (model.output_norm) {
+        cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
 
-    // LM head
-    cur = build_lora_mm(model.output, cur);
+        cb(cur, "result_norm", -1);
+        res->t_embd = cur;
 
-    cb(cur, "result_output", -1);
-    res->t_logits = cur;
+        if (model.output) {
+            // LM head
+            cur = build_lora_mm(model.output, cur);
+
+            cb(cur, "result_output", -1);
+            res->t_logits = cur;
+        }
+    } else {
+        // prima: worker in distributed inference — no output head available
+        // graph ends at the last active layer's l_out
+        res->t_embd = cur;
+    }
 
     ggml_build_forward_expand(gf, cur);
 }
@@ -93,11 +111,11 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_qwen35::build_qkvz(
     const int64_t n_seqs       = ubatch.n_seqs;
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
-    ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
+    ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input);
     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
     cb(qkv_mixed, "linear_attn_qkv_mixed", il);
 
-    ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
+    ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input);
     cb(z, "z", il);
 
     return { qkv_mixed, z };
@@ -120,13 +138,13 @@ ggml_tensor * llm_build_qwen35::build_layer_attn(
         ggml_tensor *             inp_pos,
         int *                     sections,
         int                       il) {
-    const int64_t n_embd_head = hparams.n_embd_head_v();
-    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
+    const int64_t n_embd_head = hparams.n_embd_head_v;
+    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
 
     // Order: joint QG projection, QG split, Q norm, KV projection, K norm, RoPE, attention
 
     // Qwen3Next uses a single Q projection that outputs query + gate
-    ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
+    ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur); // [ (n_embd_head * 2) * n_head, n_tokens ]
     cb(Qcur_full, "Qcur_full", il);
 
     ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
@@ -138,10 +156,10 @@ ggml_tensor * llm_build_qwen35::build_layer_attn(
     Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
     cb(Qcur, "Qcur_normed", il);
 
-    ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
+    ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur);
     cb(Kcur, "Kcur", il);
 
-    ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
+    ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur);
     cb(Vcur, "Vcur", il);
 
     // Apply K normalization
@@ -189,7 +207,7 @@ ggml_tensor * llm_build_qwen35::build_layer_attn(
     cur = ggml_mul(ctx0, cur, gate_sigmoid);
     cb(cur, "attn_gated", il);
 
-    cur = build_lora_mm(model.layers[il].wo, cur, model.layers[il].wo_s);
+    cur = build_lora_mm(model.layers[il].wo, cur);
     cb(cur, "attn_output", il);
 
     return cur;
@@ -220,14 +238,14 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
 
-    ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
+    ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur);
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
 
     beta = ggml_sigmoid(ctx0, beta);
 
-    ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
-    alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
+    ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur);
+    alpha = ggml_cont_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     cb(alpha, "alpha", il);
 
     ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
@@ -324,9 +342,9 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     //v_conv = ggml_cont_4d(ctx0, v_conv, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
 
     // if head keys and value keys are different, repeat to force tensors into matching shapes
-    // note: need explicit repeat only if we are not using the fused GDN
-    if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
+    if (num_k_heads != num_v_heads) {
         GGML_ASSERT(num_v_heads % num_k_heads == 0);
+        // TODO: try to avoid these explicit repeats by utilizing op broadcast
         q_conv = ggml_repeat_4d(ctx0, q_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
         k_conv = ggml_repeat_4d(ctx0, k_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
     }
@@ -335,8 +353,13 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
-    auto attn_out = build_delta_net(q_conv, k_conv, v_conv, gate, beta, state, il);
-
+    // Choose between build_delta_net_chunking, build_delta_net_recurrent, and build_delta_net_autoregressive based on n_tokens
+    std::pair<ggml_tensor *, ggml_tensor *> attn_out; // pair of (output, new_state)
+    if (n_seq_tokens == 1) {
+        attn_out = build_delta_net_autoregressive(q_conv, k_conv, v_conv, gate, beta, state, il);
+    } else {
+        attn_out = build_delta_net_chunking(q_conv, k_conv, v_conv, gate, beta, state, il);
+    }
     ggml_tensor * output    = attn_out.first;
     ggml_tensor * new_state = attn_out.second;
     cb(output, "attn_output", il);
@@ -359,7 +382,7 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     cb(final_output, "final_output", il);
 
     // Output projection
-    cur = build_lora_mm(model.layers[il].ssm_out, final_output, model.layers[il].ssm_out_s);
+    cur = build_lora_mm(model.layers[il].ssm_out, final_output);
     cb(cur, "linear_attn_out", il);
 
     // Reshape back to original dimensions
@@ -373,9 +396,9 @@ ggml_tensor * llm_build_qwen35::build_layer_ffn(ggml_tensor * cur, const int il)
     GGML_ASSERT(model.layers[il].ffn_gate_inp == nullptr);
 
     cur = build_ffn(cur,
-        model.layers[il].ffn_up, NULL, model.layers[il].ffn_up_s,
-        model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_s,
-        model.layers[il].ffn_down, NULL, model.layers[il].ffn_down_s,
+        model.layers[il].ffn_up, NULL, NULL,
+        model.layers[il].ffn_gate, NULL, NULL,
+        model.layers[il].ffn_down, NULL, NULL,
         NULL,
         LLM_FFN_SILU, LLM_FFN_PAR, il);
     cb(cur, "ffn_out", il);

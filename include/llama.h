@@ -5,7 +5,6 @@
 #include "ggml-cpu.h"
 #include "ggml-backend.h"
 #include "ggml-opt.h"
-#include "gguf.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -153,7 +152,6 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_TQ1_0         = 36, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_TQ2_0         = 37, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_MXFP4_MOE     = 38, // except 1d tensors
-        LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
@@ -213,6 +211,36 @@ extern "C" {
     } llama_token_data_array;
 
     typedef bool (*llama_progress_callback)(float progress, void * user_data);
+
+    //
+    // prima extension hooks - callback types for distributed inference
+    //
+
+    // layer filter callback - return true if the layer should be included
+    typedef bool (*llama_layer_filter_cb)(int32_t il, void * user_data);
+
+    // layer load filter callback - return true if the layer should be loaded
+    typedef bool (*llama_layer_load_filter_cb)(int32_t global_layer_id, void * user_data);
+
+    // layer map callback - map global layer ID to local layer ID
+    typedef int32_t (*llama_layer_map_cb)(int32_t global_layer_id, void * user_data);
+
+    // layer device select callback - return the device a layer should be placed on
+    // return NULL to use the default n_gpu_layers logic
+    typedef ggml_backend_dev_t (*llama_layer_dev_select_cb)(int32_t global_layer_id, void * user_data);
+
+    // decode callback - called before/after decode
+    typedef void (*llama_decode_cb)(struct llama_context * ctx, struct llama_batch * batch, void * user_data);
+
+    // memory operation callback - called when memory operations occur
+    // op_type: 0=clear, 1=seq_rm, 2=seq_cp, 3=seq_keep, 4=seq_add, 5=seq_div
+    typedef void (*llama_memory_op_cb)(
+            struct llama_context * ctx,
+            int                    op_type,
+            llama_seq_id           seq_id,
+            llama_pos              p0,
+            llama_pos              p1,
+            void * user_data);
 
     // Input data for llama_encode/llama_decode
     // A llama_batch object can contain input about one or many sequences
@@ -281,12 +309,20 @@ extern "C" {
         ggml_backend_buffer_type_t buft;
     };
 
+    struct llama_model_tensor_source_override {
+        const char * tensor_name;
+        const char * source_path;
+    };
+
     struct llama_model_params {
         // NULL-terminated list of devices to use for offloading (if NULL, all available devices are used)
         ggml_backend_dev_t * devices;
 
         // NULL-terminated list of buffer types to use for tensors that match a pattern
         const struct llama_model_tensor_buft_override * tensor_buft_overrides;
+
+        // NULL-terminated list of tensor source overrides keyed by exact tensor name
+        const struct llama_model_tensor_source_override * tensor_source_overrides;
 
         int32_t n_gpu_layers; // number of layers to store in VRAM, a negative value means all layers
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
@@ -307,6 +343,17 @@ extern "C" {
 
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
+
+        // prima: layer load filter for distributed inference (pipeline parallelism)
+        // set before loading to skip tensors for non-owned layers
+        llama_layer_load_filter_cb layer_load_filter;
+        llama_layer_map_cb         layer_map;
+        void *                     layer_filter_user_data;
+
+        // prima: layer device select for CPU/GPU hybrid distribution
+        // when set, overrides the default n_gpu_layers logic per layer
+        llama_layer_dev_select_cb  layer_dev_select;
+        void *                     layer_dev_select_ud;
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
@@ -360,6 +407,13 @@ extern "C" {
         // currently works only with CPU execution
         ggml_abort_callback abort_callback;
         void *              abort_callback_data;
+
+        // prima: layer filter for distributed inference (pipeline parallelism)
+        // When set, the graph builder skips layers for which the filter returns false.
+        // Must be set here (not via llama_set_layer_filter) when layer_load_filter is
+        // also used, because sched_reserve() builds a graph during context construction.
+        llama_layer_filter_cb layer_filter;
+        void *                layer_filter_ud;
 
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
         bool embeddings;  // if true, extract embeddings (together with logits)
@@ -442,30 +496,19 @@ extern "C" {
 
     LLAMA_API void llama_detach_threadpool(struct llama_context * ctx);
 
-    typedef void (*llama_model_set_tensor_data_t)(struct ggml_tensor * tensor, void * userdata);
-
-    // Create a new model from GGUF metadata as well as a function to set the tensor data
-    //   - tensors are created as GGML_TYPE_F32 by default,
-    //     override by adding a tensor with the same name but a different name to the context
-    LLAMA_API struct llama_model * llama_model_init_from_user(
-                    struct gguf_context * metadata,
-          llama_model_set_tensor_data_t   set_tensor_data,    // function to initialize tensor data with
-                                   void * set_tensor_data_ud, // userdata for function
-              struct llama_model_params   params);
-
     DEPRECATED(LLAMA_API struct llama_model * llama_load_model_from_file(
                              const char * path_model,
               struct llama_model_params   params),
             "use llama_model_load_from_file instead");
 
-    // Load a model from a file
+    // Load the model from a file
     // If the file is split into multiple parts, the file name must follow this pattern: <name>-%05d-of-%05d.gguf
     // If the split file name does not follow this pattern, use llama_model_load_from_splits
     LLAMA_API struct llama_model * llama_model_load_from_file(
                              const char * path_model,
               struct llama_model_params   params);
 
-    // Load a model from multiple splits (support custom naming scheme)
+    // Load the model from multiple splits (support custom naming scheme)
     // The paths must be in the correct order
     LLAMA_API struct llama_model * llama_model_load_from_splits(
                              const char ** paths,
@@ -636,6 +679,7 @@ extern "C" {
 
     // Load a LoRA adapter from file
     // The adapter is valid as long as the associated model is not freed
+    // All adapters must be loaded before context creation
     LLAMA_API struct llama_adapter_lora * llama_adapter_lora_init(
             struct llama_model * model,
             const char * path_lora);
@@ -659,8 +703,9 @@ extern "C" {
     LLAMA_API int32_t llama_adapter_meta_val_str_by_index(const struct llama_adapter_lora * adapter, int32_t i, char * buf, size_t buf_size);
 
     // Manually free a LoRA adapter
-    // NOTE: loaded adapters that are not manually freed will be freed when the associated model is deleted
-    LLAMA_API void llama_adapter_lora_free(struct llama_adapter_lora * adapter);
+    // NOTE: loaded adapters will be free when the associated model is deleted
+    LLAMA_API DEPRECATED(void llama_adapter_lora_free(struct llama_adapter_lora * adapter),
+            "adapters are now freed together with the associated model");
 
     // Get the invocation tokens if the current lora is an alora
     LLAMA_API uint64_t            llama_adapter_get_alora_n_invocation_tokens(const struct llama_adapter_lora * adapter);
@@ -762,6 +807,77 @@ extern "C" {
 
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
+
+    //
+    // prima extension hooks
+    //
+
+    // Set a layer filter for graph building
+    // When set, only layers for which the filter returns true will be included in the computation graph
+    LLAMA_API void llama_set_layer_filter(
+            struct llama_context *   ctx,
+            llama_layer_filter_cb    filter,
+            void * user_data);
+
+    // Set model layer load filter and mapping
+    // load_filter: return true if the layer should be loaded (pass NULL to load all)
+    // layer_map:   map global layer ID to local layer ID (pass NULL for identity mapping)
+    LLAMA_API void llama_model_set_layer_filter(
+            struct llama_model *        model,
+            llama_layer_load_filter_cb  load_filter,
+            llama_layer_map_cb          layer_map,
+            void * user_data);
+
+    // Set decode callbacks for distributed inference
+    // pre_decode:  called before decode, e.g. to receive tensors from previous node
+    // post_decode: called after decode, e.g. to send tensors to next node
+    LLAMA_API void llama_set_decode_callbacks(
+            struct llama_context * ctx,
+            llama_decode_cb        pre_decode,
+            llama_decode_cb        post_decode,
+            void * user_data);
+
+    // Set memory operation callback for distributed KV cache synchronization
+    LLAMA_API void llama_set_memory_op_callback(
+            struct llama_context * ctx,
+            llama_memory_op_cb     callback,
+            void * user_data);
+
+    // Context-aware memory operations that trigger the memory_op callback
+    // Use these instead of the llama_memory_* functions for distributed inference
+
+    LLAMA_API void llama_ctx_memory_clear(struct llama_context * ctx, bool data);
+
+    LLAMA_API bool llama_ctx_memory_seq_rm(
+            struct llama_context * ctx,
+              llama_seq_id seq_id,
+                 llama_pos p0,
+                 llama_pos p1);
+
+    LLAMA_API void llama_ctx_memory_seq_cp(
+            struct llama_context * ctx,
+              llama_seq_id seq_id_src,
+              llama_seq_id seq_id_dst,
+                 llama_pos p0,
+                 llama_pos p1);
+
+    LLAMA_API void llama_ctx_memory_seq_keep(
+            struct llama_context * ctx,
+              llama_seq_id seq_id);
+
+    LLAMA_API void llama_ctx_memory_seq_add(
+            struct llama_context * ctx,
+              llama_seq_id seq_id,
+                 llama_pos p0,
+                 llama_pos p1,
+                 llama_pos delta);
+
+    LLAMA_API void llama_ctx_memory_seq_div(
+            struct llama_context * ctx,
+              llama_seq_id seq_id,
+                 llama_pos p0,
+                 llama_pos p1,
+                       int d);
 
     //
     // State / sessions
@@ -984,7 +1100,7 @@ extern "C" {
 
     // Logits for the ith token. For positive indices, Equivalent to:
     // llama_get_logits(ctx) + ctx->output_ids[i]*n_vocab
-    // Negative indices can be used to access logits in reverse order, -1 is the last logit.
+    // Negative indicies can be used to access logits in reverse order, -1 is the last logit.
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
 
@@ -999,7 +1115,7 @@ extern "C" {
 
     // Get the embeddings for the ith token. For positive indices, Equivalent to:
     // llama_get_embeddings(ctx) + ctx->output_ids[i]*n_embd
-    // Negative indices can be used to access embeddings in reverse order, -1 is the last embedding.
+    // Negative indicies can be used to access embeddings in reverse order, -1 is the last embedding.
     // shape: [n_embd] (1-dimensional)
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
@@ -1019,9 +1135,9 @@ extern "C" {
     // Returns LLAMA_TOKEN_NULL if no token was sampled.
     LLAMA_API llama_token llama_get_sampled_token_ith(struct llama_context * ctx, int32_t i);
 
-    // Get the backend sampled probabilities for the ith token
+    // Get the backend sampled probabilites for the ith token
     // The index matches llama_get_sampled_token_ith().
-    // Returns NULL if no probabilities were generated.
+    // Returns NULL if no probabilites were generated.
     LLAMA_API float *  llama_get_sampled_probs_ith      (struct llama_context * ctx, int32_t i);
     LLAMA_API uint32_t llama_get_sampled_probs_count_ith(struct llama_context * ctx, int32_t i);
 
@@ -1348,7 +1464,7 @@ extern "C" {
                                float   tau,
                                float   eta);
 
-    /// @details Initializes a GBNF grammar, see grammars/README.md for details.
+    /// @details Intializes a GBNF grammar, see grammars/README.md for details.
     /// @param vocab The vocabulary that this grammar will be used with.
     /// @param grammar_str The production rules for the grammar, encoded as a string. Returns an empty grammar if empty. Returns NULL if parsing of grammar_str fails.
     /// @param grammar_root The name of the start symbol for the grammar.

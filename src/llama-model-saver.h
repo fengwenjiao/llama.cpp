@@ -1,6 +1,5 @@
 #pragma once
 
-#include "gguf.h"
 #include "llama.h"
 #include "llama-arch.h"
 
@@ -8,12 +7,10 @@
 
 struct llama_model_saver {
     struct gguf_context * gguf_ctx = nullptr;
-    const bool gguf_ctx_owned;
-    const struct llama_model * model;
+    const struct llama_model & model;
     const struct LLM_KV llm_kv;
 
-    llama_model_saver(const struct llama_model * model);
-    llama_model_saver(enum llm_arch arch, struct gguf_context * gguf_ctx);
+    llama_model_saver(const struct llama_model & model);
     ~llama_model_saver();
 
     void add_kv(enum llm_kv key, uint32_t     value);

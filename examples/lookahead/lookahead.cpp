@@ -4,11 +4,10 @@
 #include "log.h"
 #include "llama.h"
 
-#include <algorithm>
-#include <clocale>
 #include <cstdio>
 #include <string>
 #include <vector>
+#include <algorithm>
 
 struct ngram_data {
     bool active = false;
@@ -39,8 +38,6 @@ struct ngram_container {
 };
 
 int main(int argc, char ** argv) {
-    std::setlocale(LC_NUMERIC, "C");
-
     common_params params;
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {

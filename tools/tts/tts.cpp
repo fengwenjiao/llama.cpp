@@ -10,7 +10,6 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <clocale>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
@@ -537,8 +536,6 @@ static std::string audio_data_from_speaker(json speaker, const outetts_version t
 }
 
 int main(int argc, char ** argv) {
-    std::setlocale(LC_NUMERIC, "C");
-
     common_params params;
 
     params.out_file = "output.wav";

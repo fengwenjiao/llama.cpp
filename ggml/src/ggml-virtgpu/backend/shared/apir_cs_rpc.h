@@ -1,6 +1,3 @@
-#pragma once
-
-// clang-format off
 #include "ggml.h"
 #include "ggml-backend-impl.h"
 
@@ -8,7 +5,6 @@
 #include <unordered_set>
 #include <vector>
 #include <cstdint>
-// clang-format on
 
 // ggml_tensor is serialized into apir_rpc_tensor
 struct apir_rpc_tensor {

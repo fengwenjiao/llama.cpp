@@ -20,6 +20,10 @@ struct llama_memory_params {
 
     // use full-size SWA cache
     bool swa_full;
+
+    // layer filter for distributed inference (optional, nullptr = include all layers)
+    llama_layer_filter_cb layer_filter;
+    void *                layer_filter_ud;
 };
 
 enum llama_memory_status {

@@ -116,115 +116,6 @@ llama_pos mtmd_helper_get_n_pos(const mtmd_input_chunks * chunks) {
 
 // helper struct to make working with embd batch easier
 // note: this will be removed after llama_batch_ext refactoring
-struct decode_embd_batch {
-    int n_pos_per_embd;
-    int n_mmproj_embd;
-    std::vector<llama_pos>      pos;
-    std::vector<llama_pos>      pos_view; // used by mrope
-    std::vector<int32_t>        n_seq_id;
-    std::vector<llama_seq_id>   seq_id_0;
-    std::vector<llama_seq_id *> seq_ids;
-    std::vector<int8_t>         logits;
-    llama_batch batch;
-    decode_embd_batch(float * embd, int32_t n_tokens, int n_pos_per_embd, int n_mmproj_embd) : n_pos_per_embd(n_pos_per_embd), n_mmproj_embd(n_mmproj_embd) {
-        pos     .resize(n_tokens * n_pos_per_embd);
-        n_seq_id.resize(n_tokens);
-        seq_ids .resize(n_tokens + 1);
-        logits  .resize(n_tokens);
-        seq_id_0.resize(1);
-        seq_ids [n_tokens] = nullptr;
-        batch = {
-            /*n_tokens       =*/ n_tokens,
-            /*tokens         =*/ nullptr,
-            /*embd           =*/ embd,
-            /*pos            =*/ pos.data(),
-            /*n_seq_id       =*/ n_seq_id.data(),
-            /*seq_id         =*/ seq_ids.data(),
-            /*logits         =*/ logits.data(),
-        };
-    }
-
-    void set_position_normal(llama_pos pos_0, llama_seq_id seq_id) {
-        seq_id_0[0] = seq_id;
-        for (int i = 0; i < batch.n_tokens; i++) {
-            batch.pos     [i] = pos_0 + i;
-            batch.n_seq_id[i] = 1;
-            batch.seq_id  [i] = seq_id_0.data();
-            batch.logits  [i] = false;
-        }
-    }
-
-    // M-RoPE for image
-    void set_position_mrope_2d(llama_pos pos_0, int nx, int ny, llama_seq_id seq_id) {
-        GGML_ASSERT(n_pos_per_embd == 4);
-        seq_id_0[0] = seq_id;
-        for (int y = 0; y < ny; y++) {
-            for (int x = 0; x < nx; x++) {
-                int i = y * nx + x;
-                pos[i                     ] = pos_0;
-                pos[i + batch.n_tokens    ] = pos_0 + y;
-                pos[i + batch.n_tokens * 2] = pos_0 + x;
-                pos[i + batch.n_tokens * 3] = 0; // last pos dim is unused
-            }
-        }
-        for (int i = 0; i < batch.n_tokens; i++) {
-            batch.n_seq_id[i] = 1;
-            batch.seq_id  [i] = seq_id_0.data();
-            batch.logits  [i] = false;
-        }
-    }
-
-    // M-RoPE for audio
-    void set_position_mrope_1d(llama_pos pos_0, llama_seq_id seq_id) {
-        GGML_ASSERT(n_pos_per_embd == 4);
-        seq_id_0[0] = seq_id;
-        for (int i = 0; i < batch.n_tokens; i++) {
-            pos[i                     ] = pos_0 + i;
-            pos[i + batch.n_tokens    ] = pos_0 + i;
-            pos[i + batch.n_tokens * 2] = pos_0 + i;
-            pos[i + batch.n_tokens * 3] = 0; // last pos dim is unused
-        }
-        for (int i = 0; i < batch.n_tokens; i++) {
-            batch.n_seq_id[i] = 1;
-            batch.seq_id  [i] = seq_id_0.data();
-            batch.logits  [i] = false;
-        }
-    }
-
-    llama_batch get_view(int offset, int n_tokens) {
-        llama_pos * pos_ptr;
-        pos_view.clear();
-        pos_view.reserve(n_tokens * n_pos_per_embd);
-        if (n_pos_per_embd > 1) {
-            // mrope
-            // for example, with layout of src: 1234...1234...1234...1234...
-            //       offset 2 will give us dst: 34...34...34...34...
-            for (int i = 0; i < n_pos_per_embd; i++) {
-                // assume n_tokens is less than or equal to batch.n_tokens
-                // batch.n_tokens is number of **total** tokens
-                // n_tokens is number of viewed token
-                size_t src_idx = i * batch.n_tokens + offset;
-                pos_view.insert(pos_view.end(),
-                    pos.data() + src_idx,
-                    pos.data() + src_idx + n_tokens);
-            }
-            pos_ptr = pos_view.data();
-        } else {
-            // normal
-            pos_ptr = pos.data() + offset;
-        }
-        return {
-            /*n_tokens       =*/ n_tokens,
-            /*tokens         =*/ nullptr,
-            /*embd           =*/ batch.embd     + offset * n_mmproj_embd,
-            /*pos            =*/ pos_ptr,
-            /*n_seq_id       =*/ batch.n_seq_id + offset,
-            /*seq_id         =*/ batch.seq_id   + offset,
-            /*logits         =*/ batch.logits   + offset,
-        };
-    }
-};
-
 // Helper function for decoding an image whose embeddings have already been calculated
 int32_t mtmd_helper_decode_image_chunk(
         mtmd_context * ctx,
@@ -248,7 +139,7 @@ int32_t mtmd_helper_decode_image_chunk(
 
     int32_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
     int32_t i_batch = 0;
-    int32_t n_img_batches = (n_tokens + n_batch - 1) / n_batch;
+    int32_t n_img_batches = GGML_PAD(n_tokens, n_batch) / n_batch;
     decode_embd_batch batch_embd(encoded_embd, n_tokens, n_pos_per_embd, n_mmproj_embd);
 
     if (mtmd_decode_use_mrope(ctx)) {
@@ -470,12 +361,12 @@ static bool decode_audio_from_buf(const unsigned char * buf_in, size_t len, int 
 mtmd_bitmap * mtmd_helper_bitmap_init_from_buf(mtmd_context * ctx, const unsigned char * buf, size_t len) {
     if (audio_helpers::is_audio_file((const char *)buf, len)) {
         std::vector<float> pcmf32;
-        const int sample_rate = mtmd_get_audio_sample_rate(ctx);
-        if (sample_rate < 0) {
+        int bitrate = mtmd_get_audio_bitrate(ctx);
+        if (bitrate < 0) {
             LOG_ERR("This model does not support audio input\n");
             return nullptr;
         }
-        if (!audio_helpers::decode_audio_from_buf(buf, len, sample_rate, pcmf32)) {
+        if (!audio_helpers::decode_audio_from_buf(buf, len, bitrate, pcmf32)) {
             LOG_ERR("Unable to read WAV audio file from buffer\n");
             return nullptr;
         }

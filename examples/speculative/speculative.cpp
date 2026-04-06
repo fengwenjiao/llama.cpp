@@ -5,7 +5,6 @@
 #include "llama.h"
 
 #include <algorithm>
-#include <clocale>
 #include <cstdio>
 #include <cstring>
 #include <random>
@@ -31,8 +30,6 @@ struct seq_draft {
 };
 
 int main(int argc, char ** argv) {
-    std::setlocale(LC_NUMERIC, "C");
-
     common_params params;
 
     // needed to get candidate probs even for temp <= 0.0

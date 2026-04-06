@@ -1,4 +1,4 @@
-import { AUTO_SCROLL_AT_BOTTOM_THRESHOLD, AUTO_SCROLL_INTERVAL } from '$lib/constants';
+import { AUTO_SCROLL_AT_BOTTOM_THRESHOLD, AUTO_SCROLL_INTERVAL } from '$lib/constants/auto-scroll';
 
 export interface AutoScrollOptions {
 	/** Whether auto-scroll is disabled globally (e.g., from settings) */
