@@ -26,6 +26,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
+    SERVER_TASK_TYPE_SCALE_SLOTS,
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -164,6 +165,9 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale
+
+    // used by SERVER_TASK_TYPE_SCALE_SLOTS
+    int32_t scale_np = 0; // target number of parallel slots
 
     server_task() = default;
 
@@ -550,6 +554,14 @@ struct server_task_result_get_lora : server_task_result {
 };
 
 struct server_task_result_apply_lora : server_task_result {
+    virtual json to_json() override;
+};
+
+struct server_task_result_scale_slots : server_task_result {
+    int32_t old_np = 0;
+    int32_t new_np = 0;
+    int32_t n_busy = 0;
+    float   kv_usage_ratio = 0.0f;
     virtual json to_json() override;
 };
 

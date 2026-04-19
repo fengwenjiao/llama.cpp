@@ -1743,11 +1743,19 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
         for (uint32_t i = range.first; i < range.second; ++i) {
             std::vector<llama_seq_id> seq_ids;
 
-            for (llama_seq_id cur = 0; cur < (int) n_seq_max; ++cur) {
-                if (cur == seq_id || seq_id == -1) {
+            if (seq_id == -1) {
+                // save all sequences that occupy this cell
+                for (llama_seq_id cur = 0; cur < (int) n_seq_max; ++cur) {
                     if (cells.seq_has(i, cur)) {
                         seq_ids.push_back(cur);
                     }
+                }
+            } else {
+                // save only the specified sequence — check directly instead of
+                // scanning [0, n_seq_max), which would miss seq_ids >= n_seq_max
+                // (e.g. dynamically added slots whose seq_id exceeds the initial n_parallel)
+                if (cells.seq_has(i, seq_id)) {
+                    seq_ids.push_back(seq_id);
                 }
             }
 

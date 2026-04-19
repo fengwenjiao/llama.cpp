@@ -1837,6 +1837,20 @@ json server_task_result_apply_lora::to_json() {
 }
 
 //
+// server_task_result_scale_slots
+//
+
+json server_task_result_scale_slots::to_json() {
+    return json {
+        { "success",        true },
+        { "old_np",         old_np },
+        { "new_np",         new_np },
+        { "n_busy",         n_busy },
+        { "kv_usage_ratio", kv_usage_ratio },
+    };
+}
+
+//
 // server_prompt_cache
 //
 size_t server_prompt_cache::size() const {

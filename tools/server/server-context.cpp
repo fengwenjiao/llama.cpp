@@ -2213,6 +2213,76 @@ private:
                     res->id = task.id;
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_SCALE_SLOTS:
+                {
+                    const int32_t target_np = task.scale_np;
+                    const int32_t old_np    = (int32_t)slots.size();
+
+                    auto res = std::make_unique<server_task_result_scale_slots>();
+                    res->id = task.id;
+                    res->old_np = old_np;
+
+                    // count busy slots
+                    int32_t n_busy = 0;
+                    for (const auto & s : slots) {
+                        if (s.is_processing()) n_busy++;
+                    }
+                    res->n_busy = n_busy;
+
+                    // only allow scaling up, and only in unified KV mode
+                    if (!params_base.kv_unified) {
+                        send_error(task, "slot scaling requires unified KV cache mode (--kv-unified)",
+                                   ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+
+                    if (target_np <= old_np) {
+                        // nothing to do — already have enough slots
+                        res->new_np = old_np;
+                        res->kv_usage_ratio = get_kv_usage_ratio();
+                        SRV_INF("scale_slots: target_np=%d <= old_np=%d, no-op\n", target_np, old_np);
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+
+                    // create new slot objects (unified mode: zero KV cost)
+                    const int n_ctx_slot  = llama_n_ctx_seq(ctx);
+                    const bool can_spec   = common_speculative_is_compat(ctx);
+                    const int  n_new      = target_np - old_np;
+
+                    for (int i = 0; i < n_new; i++) {
+                        server_slot slot;
+                        slot.id         = old_np + i;
+                        slot.ctx        = ctx;
+                        slot.n_ctx      = n_ctx_slot;
+                        slot.pctx       = pctx;
+                        slot.kv_unified = true;
+
+                        slot.mctx                   = mctx;
+                        slot.prompt.tokens.has_mtmd  = mctx != nullptr;
+
+                        if (can_spec && !mctx) {
+                            slot.spec = common_speculative_init(params_base.speculative, slot.ctx);
+                        }
+
+                        slot.callback_on_release = [this](int id_slot) {
+                            queue_tasks.pop_deferred_task(id_slot);
+                        };
+
+                        slot.reset();
+
+                        SLT_INF(slot, "scale_slots: new slot, n_ctx = %d\n", slot.n_ctx);
+                        slots.push_back(std::move(slot));
+                    }
+
+                    params_base.n_parallel = target_np;
+
+                    res->new_np = target_np;
+                    res->kv_usage_ratio = get_kv_usage_ratio();
+                    SRV_INF("scale_slots: %d → %d slots, kv_usage=%.1f%%\n",
+                            old_np, target_np, res->kv_usage_ratio * 100);
+                    queue_results.send(std::move(res));
+                } break;
         }
     }
 
@@ -2624,6 +2694,22 @@ private:
 
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
+                        // In unified KV mode, check if the shared KV pool has
+                        // enough room for this prompt before committing.  If it
+                        // doesn't fit, leave the slot in STARTED state so it
+                        // will be retried on the next update_slots() cycle
+                        // (after other slots finish and free KV space).
+                        if (slot.kv_unified) {
+                            const float kv_ratio = get_kv_usage_ratio();
+                            const int32_t new_tokens = slot.task->n_tokens();
+                            const float projected = kv_ratio + (float)new_tokens / (float)n_ctx;
+                            if (projected > 1.0f) {
+                                SLT_WRN(slot, "KV pool full (%.1f%% used + %d new > %d ctx), deferring prompt\n",
+                                        kv_ratio * 100.0f, new_tokens, n_ctx);
+                                continue;
+                            }
+                        }
+
                         slot.t_start_process_prompt = ggml_time_us();
                         slot.t_start_generation = 0;
 
@@ -4438,6 +4524,48 @@ void server_routes::init_routes() {
         }
 
         GGML_ASSERT(dynamic_cast<server_task_result_apply_lora*>(result.get()) != nullptr);
+        res->ok(result->to_json());
+        return res;
+    };
+
+    // POST /slots/scale — dynamically add slots (unified KV mode only)
+    this->post_slots_scale = [this](const server_http_req & req) {
+        auto res = create_response();
+        const json body = json::parse(req.body);
+
+        if (!body.contains("np") || !body["np"].is_number_integer()) {
+            res->error(format_error_response(
+                "Request body must contain integer field \"np\" (target number of parallel slots)",
+                ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        const int32_t target_np = body["np"].get<int32_t>();
+        if (target_np <= 0) {
+            res->error(format_error_response("\"np\" must be positive", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_SCALE_SLOTS);
+            task.id       = rd.get_new_id();
+            task.scale_np = target_np;
+            rd.post_task(std::move(task));
+        }
+
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
+        GGML_ASSERT(dynamic_cast<server_task_result_scale_slots*>(result.get()) != nullptr);
         res->ok(result->to_json());
         return res;
     };
