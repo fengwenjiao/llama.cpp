@@ -127,6 +127,21 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// =====================================================================
+// scale_slots cross-talk diagnostic — gated on env LLAMA_DBG_SCALE=1
+// =====================================================================
+static bool dbg_scale_enabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char * e = getenv("LLAMA_DBG_SCALE");
+        cached = (e && atoi(e) != 0) ? 1 : 0;
+    }
+    return cached == 1;
+}
+#define DBG_SCALE(...) do { \
+    if (dbg_scale_enabled()) { fprintf(stderr, "[DBG_SCALE] " __VA_ARGS__); fflush(stderr); } \
+} while (0)
+
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
     SLOT_STATE_IDLE,
@@ -680,6 +695,11 @@ private:
 
     int32_t n_ctx; // total context for all clients / slots
 
+    // Cached at startup; do NOT re-evaluate while slots are active because
+    // common_speculative_is_compat() calls llama_memory_clear() which wipes
+    // the entire KV cache (corrupting any in-flight slots' state).
+    bool can_spec_cached = false;
+
     // slots / clients
     std::vector<server_slot> slots;
 
@@ -895,7 +915,11 @@ private:
 
         slots.clear();
 
-        const bool can_spec = common_speculative_is_compat(ctx);
+        // Cache compatibility check at startup.  Re-running this later
+        // (e.g., from scale_slots) would call llama_memory_clear() inside
+        // common_speculative_is_compat() and wipe live slots' KV cache.
+        can_spec_cached = common_speculative_is_compat(ctx);
+        const bool can_spec = can_spec_cached;
         if (!can_spec) {
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
         }
@@ -2247,8 +2271,26 @@ private:
 
                     // create new slot objects (unified mode: zero KV cost)
                     const int n_ctx_slot  = llama_n_ctx_seq(ctx);
-                    const bool can_spec   = common_speculative_is_compat(ctx);
+                    // CRITICAL: do NOT call common_speculative_is_compat(ctx) here.
+                    // That helper calls llama_memory_clear(mem, true) twice as part
+                    // of its probe, which wipes the entire KV cache including all
+                    // in-flight slots' tokens.  The result is "open-correct, mid-
+                    // stream off-topic" cross-talk: scaling at runtime corrupts
+                    // any concurrently-decoding requests' attention state.
+                    // We use the cached startup value instead.
+                    const bool can_spec   = can_spec_cached;
                     const int  n_new      = target_np - old_np;
+
+                    if (dbg_scale_enabled()) {
+                        DBG_SCALE("SCALE_BEGIN old=%d -> new=%d slots.size=%zu cap=%zu n_seq_max=%u\n",
+                                  old_np, target_np, slots.size(), slots.capacity(), llama_n_seq_max(ctx));
+                        for (const auto & s : slots) {
+                            if (s.state == SLOT_STATE_IDLE) continue;
+                            DBG_SCALE("  pre-scale slot=%d state=%d n_decoded=%d prompt.n_tokens=%d i_batch=%d sampled=%d pos_max=%d\n",
+                                      s.id, (int)s.state, s.n_decoded, (int)s.prompt.n_tokens(), s.i_batch, (int)s.sampled,
+                                      (int)llama_memory_seq_pos_max(llama_get_memory(ctx), s.id));
+                        }
+                    }
 
                     for (int i = 0; i < n_new; i++) {
                         server_slot slot;
@@ -2276,6 +2318,17 @@ private:
                     }
 
                     params_base.n_parallel = target_np;
+
+                    if (dbg_scale_enabled()) {
+                        DBG_SCALE("SCALE_END   slots.size=%zu cap=%zu n_seq_max=%u\n",
+                                  slots.size(), slots.capacity(), llama_n_seq_max(ctx));
+                        for (const auto & s : slots) {
+                            if (s.state == SLOT_STATE_IDLE) continue;
+                            DBG_SCALE("  post-scale slot=%d state=%d n_decoded=%d prompt.n_tokens=%d i_batch=%d sampled=%d pos_max=%d\n",
+                                      s.id, (int)s.state, s.n_decoded, (int)s.prompt.n_tokens(), s.i_batch, (int)s.sampled,
+                                      (int)llama_memory_seq_pos_max(llama_get_memory(ctx), s.id));
+                        }
+                    }
 
                     res->new_np = target_np;
                     res->kv_usage_ratio = get_kv_usage_ratio();
@@ -3350,6 +3403,10 @@ private:
                 const int tok_idx = slot.i_batch - i;
 
                 llama_token id = common_sampler_sample(slot.smpl.get(), ctx, tok_idx);
+
+                DBG_SCALE("SAMPLE slot=%d task=%d n_decoded=%d i_batch=%d tok_idx=%d -> token=%d pos_max=%d\n",
+                          slot.id, (int)slot.task->id, slot.n_decoded, slot.i_batch, tok_idx, (int)id,
+                          (int)llama_memory_seq_pos_max(llama_get_memory(ctx), slot.id));
 
                 slot.i_batch = -1;
 
